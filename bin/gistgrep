@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+"""gistgrep: fast local search over your GitHub gists.
+
+Mirrors your gists to ~/.cache/gistgrep/, auto-syncs on each run via a
+cheap 1-call freshness check, and ranks matches by
+title > filename > body, with a recency boost.
+
+By default drops into an interactive fzf TUI with a live preview pane.
+Pipes and --plain fall back to plain-text output.
+
+Usage:
+  gistgrep                  # interactive TUI
+  gistgrep <query>          # interactive, pre-filtered
+  gistgrep --plain <q>      # plain-text list (scriptable)
+  gistgrep --sync           # force full resync
+  gistgrep --no-sync <q>    # search cached only
+  gistgrep --limit 50 <q>
+
+Interactive bindings:
+  Enter    open gist in browser
+  Ctrl-Y   copy gist URL to clipboard
+  Ctrl-E   open cached copy in $EDITOR
+  Esc      quit
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+CACHE = Path(os.path.expanduser("~/.cache/gistgrep"))
+GISTS = CACHE / "gists"
+STATE = CACHE / "state.json"
+APPLE_LLM_BIN = CACHE / "apple-llm"
+APPLE_LLM_SRC = CACHE / "apple-llm.swift"
+SUMMARIZE_LOCK = CACHE / "summarize.lock"
+RECONCILE_INTERVAL = 7 * 86400
+RECONCILE_WINDOW = 100
+SUMMARY_MAX_FILE_CHARS = 2000
+SUMMARY_MAX_TOTAL_CHARS = 8000
+SUMMARY_TIMEOUT = 60
+
+
+def _migrate_legacy_cache():
+    """One-time migration from the previous ~/.cache/gist-search path."""
+    legacy = Path(os.path.expanduser("~/.cache/gist-search"))
+    if legacy.exists() and not CACHE.exists():
+        try:
+            legacy.rename(CACHE)
+            print(f"gistgrep: migrated cache from {legacy} → {CACHE}", file=sys.stderr)
+        except OSError:
+            pass
+
+
+_migrate_legacy_cache()
+
+
+APPLE_LLM_SWIFT = r"""
+import Foundation
+import FoundationModels
+
+@main
+struct AppleLLM {
+    static func main() async {
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        guard let prompt = String(data: data, encoding: .utf8) else {
+            FileHandle.standardError.write("error: invalid utf-8 on stdin\n".data(using: .utf8)!)
+            exit(2)
+        }
+        switch SystemLanguageModel.default.availability {
+        case .available:
+            break
+        case .unavailable(let reason):
+            FileHandle.standardError.write("unavailable: \(reason)\n".data(using: .utf8)!)
+            exit(3)
+        }
+        do {
+            let session = LanguageModelSession()
+            let response = try await session.respond(to: prompt)
+            print(response.content)
+        } catch {
+            FileHandle.standardError.write("error: \(error)\n".data(using: .utf8)!)
+            exit(1)
+        }
+    }
+}
+"""
+
+
+def ensure_apple_llm(state):
+    """Compile the Swift helper on first use. Returns (available, reason)."""
+    if state.get("apple_llm_status") == "unavailable":
+        return False, state.get("apple_llm_reason", "previously unavailable")
+    if APPLE_LLM_BIN.exists() and state.get("apple_llm_status") == "available":
+        return True, None
+    if sys.platform != "darwin":
+        state["apple_llm_status"] = "unavailable"
+        state["apple_llm_reason"] = "not macOS"
+        save_state(state)
+        return False, "not macOS"
+    if not shutil.which("swiftc"):
+        state["apple_llm_status"] = "unavailable"
+        state["apple_llm_reason"] = "swiftc not found (install Xcode CLI tools)"
+        save_state(state)
+        return False, state["apple_llm_reason"]
+    CACHE.mkdir(parents=True, exist_ok=True)
+    APPLE_LLM_SRC.write_text(APPLE_LLM_SWIFT)
+    try:
+        subprocess.run(
+            ["swiftc", "-O", "-parse-as-library", str(APPLE_LLM_SRC), "-o", str(APPLE_LLM_BIN)],
+            capture_output=True, text=True, check=True, timeout=120,
+        )
+    except subprocess.CalledProcessError as e:
+        state["apple_llm_status"] = "unavailable"
+        state["apple_llm_reason"] = f"compile failed: {e.stderr.strip()[:200]}"
+        save_state(state)
+        return False, state["apple_llm_reason"]
+    except subprocess.TimeoutExpired:
+        state["apple_llm_status"] = "unavailable"
+        state["apple_llm_reason"] = "swiftc timed out"
+        save_state(state)
+        return False, state["apple_llm_reason"]
+    # Smoke test
+    try:
+        r = subprocess.run(
+            [str(APPLE_LLM_BIN)], input="Say OK", capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            msg = (r.stderr or "").strip().splitlines()[0] if r.stderr else f"exit {r.returncode}"
+            state["apple_llm_status"] = "unavailable"
+            state["apple_llm_reason"] = msg[:200]
+            save_state(state)
+            return False, msg
+    except subprocess.TimeoutExpired:
+        state["apple_llm_status"] = "unavailable"
+        state["apple_llm_reason"] = "smoke test timed out"
+        save_state(state)
+        return False, state["apple_llm_reason"]
+    state["apple_llm_status"] = "available"
+    state["apple_llm_reason"] = None
+    save_state(state)
+    return True, None
+
+
+def run_apple_llm(prompt, timeout=SUMMARY_TIMEOUT):
+    try:
+        r = subprocess.run(
+            [str(APPLE_LLM_BIN)],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def gh_api(path):
+    r = subprocess.run(
+        ["gh", "api", path], capture_output=True, text=True, check=True
+    )
+    return json.loads(r.stdout)
+
+
+def gh_api_paginated(path):
+    r = subprocess.run(
+        ["gh", "api", "--paginate", path],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(r.stdout)
+
+
+def load_state():
+    if STATE.exists():
+        try:
+            return json.loads(STATE.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {"last_updated_at": None, "last_reconcile": 0}
+
+
+def save_state(s):
+    CACHE.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(s, indent=2))
+
+
+def safe_name(name):
+    return name.replace("/", "_").replace("\0", "_")
+
+
+def save_gist(g):
+    d = GISTS / g["id"]
+    d.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "id": g["id"],
+        "description": g.get("description") or "",
+        "updated_at": g["updated_at"],
+        "html_url": g["html_url"],
+        "public": g.get("public", False),
+        "files": list(g.get("files", {}).keys()),
+    }
+    # Invalidate stale summary when the gist has changed
+    prev_meta_path = d / "_meta.json"
+    summary_path = d / "_summary.json"
+    if prev_meta_path.exists() and summary_path.exists():
+        try:
+            prev = json.loads(prev_meta_path.read_text())
+            if prev.get("updated_at") != meta["updated_at"]:
+                summary_path.unlink()
+        except (json.JSONDecodeError, OSError):
+            pass
+    (d / "_meta.json").write_text(json.dumps(meta, indent=2))
+    for name, f in g.get("files", {}).items():
+        content = f.get("content") or ""
+        # The /gists LIST endpoint omits content entirely; individual fetch may
+        # truncate large files. Either way: if content is missing or truncated,
+        # fetch from raw_url (works for secret gists via unguessable URL).
+        if (not content or f.get("truncated")) and f.get("raw_url"):
+            try:
+                with urllib.request.urlopen(f["raw_url"], timeout=30) as resp:
+                    content = resp.read().decode("utf-8", "replace")
+            except Exception as e:
+                print(
+                    f"gistgrep: warn: failed to fetch {name} of {g['id']}: {e}",
+                    file=sys.stderr,
+                )
+        try:
+            (d / safe_name(name)).write_text(content, errors="replace")
+        except OSError as e:
+            print(
+                f"gistgrep: warn: failed to write {name} of {g['id']}: {e}",
+                file=sys.stderr,
+            )
+
+
+def remote_max_updated_at():
+    latest = gh_api("/gists?per_page=1")
+    return latest[0]["updated_at"] if latest else None
+
+
+def needs_sync(state):
+    try:
+        remote_max = remote_max_updated_at()
+    except subprocess.CalledProcessError as e:
+        print(f"gistgrep: freshness check failed: {e.stderr}", file=sys.stderr)
+        return False, None
+    return remote_max != state.get("last_updated_at"), remote_max
+
+
+def sync(since=None):
+    path = "/gists?per_page=100"
+    if since:
+        path = f"/gists?since={since}&per_page=100"
+    gists = gh_api_paginated(path)
+    for g in gists:
+        save_gist(g)
+    return len(gists)
+
+
+def reconcile_bg():
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--reconcile"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def summarize_bg():
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--summarize-queue"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def build_summary_prompt(meta, files_content):
+    # Keep prompt tight so LLM output stays well under its token cap
+    max_files = 5
+    items = list(files_content.items())[:max_files]
+    filenames = [fn for fn, _ in items]
+    example_files = ", ".join(f'"{fn}": "purpose of this file"' for fn in filenames[:2])
+    parts = [
+        "You are summarizing a GitHub gist for a preview UI. Be terse and factual.",
+        "",
+        "Output ONLY a JSON object, one line, no markdown fences, no prose before or after.",
+        "The 'summary' field is <=80 chars describing the gist overall.",
+        "The 'files' object maps EACH filename below to a <=60 char description of what that file contains.",
+        f"Use these exact filename keys: {filenames}",
+        "",
+        "Example output format (do not copy its content, only its shape):",
+        '{"summary":"Script backing up gists to S3","files":{' + example_files + "}}",
+        "",
+        f'Gist description: {meta["description"] or "(none)"}',
+        "",
+    ]
+    total = 0
+    per_file_budget = max(400, SUMMARY_MAX_TOTAL_CHARS // max(1, len(items)))
+    for fn, content in items:
+        snippet = content[:per_file_budget]
+        if total + len(snippet) > SUMMARY_MAX_TOTAL_CHARS:
+            snippet = snippet[: max(0, SUMMARY_MAX_TOTAL_CHARS - total)]
+        total += len(snippet)
+        parts.append(f"--- {fn} ---")
+        parts.append(snippet if snippet else "(empty)")
+        parts.append("")
+        if total >= SUMMARY_MAX_TOTAL_CHARS:
+            break
+    return "\n".join(parts)
+
+
+_SUMMARY_RE = re.compile(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_FILE_ITEM_RE = re.compile(r'"((?:[^"\\]|\\.)+)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def parse_summary_json(raw):
+    """Parse LLM output. If truncated, salvage the summary and any complete file entries."""
+    if not raw:
+        return None
+    s = raw.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s.startswith("json\n"):
+            s = s[5:]
+    # Attempt 1: direct JSON
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    # Attempt 2: find {...} substring
+    start = s.find("{")
+    end = s.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(s[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+    # Attempt 3: salvage from truncated output
+    m = _SUMMARY_RE.search(s)
+    if not m:
+        return None
+    summary = m.group(1).encode().decode("unicode_escape", errors="replace")
+    files = {}
+    # Look for "files": { ... } region and extract complete pairs within it
+    files_start = s.find('"files"')
+    if files_start >= 0:
+        brace = s.find("{", files_start)
+        if brace >= 0:
+            region = s[brace:]
+            # Pull complete key:value pairs; ignore the outer "summary" field if it was before
+            for fm in _FILE_ITEM_RE.finditer(region):
+                k = fm.group(1).encode().decode("unicode_escape", errors="replace")
+                v = fm.group(2).encode().decode("unicode_escape", errors="replace")
+                if k == "summary":
+                    continue
+                files[k] = v
+    return {"summary": summary, "files": files, "_salvaged": True}
+
+
+def summarize_gist(gist_id):
+    d = GISTS / gist_id
+    meta_file = d / "_meta.json"
+    if not meta_file.exists():
+        return False
+    meta = json.loads(meta_file.read_text())
+    files_content = {}
+    for fn in meta["files"]:
+        p = d / safe_name(fn)
+        if p.exists():
+            try:
+                files_content[fn] = p.read_text(errors="replace")
+            except OSError:
+                files_content[fn] = ""
+        else:
+            files_content[fn] = ""
+    prompt = build_summary_prompt(meta, files_content)
+    raw = run_apple_llm(prompt)
+    parsed = parse_summary_json(raw)
+    if not parsed:
+        # Store raw fallback so we don't re-attempt forever; user sees it anyway.
+        parsed = {"summary": (raw or "")[:120], "files": {}, "_unparsed": True}
+    parsed["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    parsed["updated_at"] = meta["updated_at"]
+    (d / "_summary.json").write_text(json.dumps(parsed, indent=2))
+    return True
+
+
+def summarize_queue():
+    """Background worker: summarize any gist missing a fresh summary. Single-instance."""
+    state = load_state()
+    available, _ = ensure_apple_llm(state)
+    if not available:
+        return
+    # Single-instance lock — check PID, not age (process may die unexpectedly)
+    def acquire():
+        return os.open(str(SUMMARIZE_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+
+    try:
+        fd = acquire()
+    except FileExistsError:
+        try:
+            pid_str = SUMMARIZE_LOCK.read_text().strip()
+            pid = int(pid_str) if pid_str.isdigit() else 0
+            alive = False
+            if pid > 0:
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                except ProcessLookupError:
+                    alive = False
+                except PermissionError:
+                    alive = True
+            if alive:
+                return
+            SUMMARIZE_LOCK.unlink()
+            fd = acquire()
+        except (FileNotFoundError, OSError, ValueError):
+            return
+    try:
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.close(fd)
+        if not GISTS.exists():
+            return
+        for d in sorted(GISTS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            meta_file = d / "_meta.json"
+            summary_file = d / "_summary.json"
+            if not meta_file.exists():
+                continue
+            needs = True
+            if summary_file.exists():
+                try:
+                    meta = json.loads(meta_file.read_text())
+                    summ = json.loads(summary_file.read_text())
+                    if summ.get("updated_at") == meta["updated_at"] and not summ.get("_unparsed"):
+                        needs = False
+                except (json.JSONDecodeError, OSError):
+                    pass
+            if needs:
+                summarize_gist(d.name)
+    finally:
+        try:
+            SUMMARIZE_LOCK.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def do_reconcile():
+    try:
+        recent = gh_api(f"/gists?per_page={RECONCILE_WINDOW}")
+    except subprocess.CalledProcessError:
+        return
+    if not recent:
+        return
+    recent_ids = {g["id"] for g in recent}
+    oldest = min(g["updated_at"] for g in recent)
+    removed = 0
+    if GISTS.exists():
+        for d in GISTS.iterdir():
+            meta_file = d / "_meta.json"
+            if not meta_file.exists():
+                continue
+            try:
+                meta = json.loads(meta_file.read_text())
+            except json.JSONDecodeError:
+                continue
+            if meta["updated_at"] >= oldest and meta["id"] not in recent_ids:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+    state = load_state()
+    state["last_reconcile"] = int(time.time())
+    save_state(state)
+
+
+def score(query, meta, body_text):
+    q = query.lower()
+    s = 0.0
+    hits = []
+    desc = meta["description"].lower()
+    if q in desc:
+        c = desc.count(q)
+        s += 10.0 * c
+        hits.append(f"title×{c}")
+    file_hits = sum(1 for fn in meta["files"] if q in fn.lower())
+    if file_hits:
+        s += 5.0 * file_hits
+        hits.append(f"file×{file_hits}")
+    body_hits = body_text.lower().count(q)
+    if body_hits:
+        s += 1.0 * body_hits
+        hits.append(f"body×{body_hits}")
+    if s == 0:
+        return 0.0, hits
+    try:
+        updated = datetime.fromisoformat(meta["updated_at"].replace("Z", "+00:00"))
+        age_days = (datetime.now(timezone.utc) - updated).days
+    except Exception:
+        age_days = 9999
+    # Recency boost: up to +5 for very recent, decaying over ~180 days
+    s += max(0.0, 5.0 * (1.0 - min(age_days, 180) / 180.0))
+    return s, hits
+
+
+def load_body(d, meta):
+    parts = []
+    for fn in meta["files"]:
+        p = d / safe_name(fn)
+        if p.exists():
+            try:
+                parts.append(p.read_text(errors="replace"))
+            except OSError:
+                pass
+    return "\n".join(parts)
+
+
+def search(query, limit=20):
+    results = []
+    if not GISTS.exists():
+        return results
+    for d in GISTS.iterdir():
+        if not d.is_dir():
+            continue
+        meta_file = d / "_meta.json"
+        if not meta_file.exists():
+            continue
+        try:
+            meta = json.loads(meta_file.read_text())
+        except json.JSONDecodeError:
+            continue
+        body = load_body(d, meta)
+        sc, hits = score(query, meta, body)
+        if sc > 0:
+            results.append((sc, meta, hits))
+    results.sort(key=lambda x: -x[0])
+    return results[:limit]
+
+
+def fmt_plain(results):
+    if not results:
+        print("No matches.")
+        return
+    for sc, meta, hits in results:
+        desc = meta["description"] or "(no description)"
+        files = ", ".join(meta["files"][:3])
+        if len(meta["files"]) > 3:
+            files += f", +{len(meta['files']) - 3}"
+        marker = " " if meta.get("public") else "🔒"
+        print(f"{marker} {meta['updated_at'][:10]}  {desc[:70]}")
+        print(f"          {files}")
+        print(f"          {meta['html_url']}")
+
+
+def fzf_available():
+    return shutil.which("fzf") is not None
+
+
+def gh_available():
+    if not shutil.which("gh"):
+        return False, "gh not found (install: brew install gh)"
+    r = subprocess.run(
+        ["gh", "auth", "status"], capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        return False, "gh not authenticated (run: gh auth login)"
+    return True, None
+
+
+def doctor():
+    print("gistgrep doctor")
+    print("─" * 40)
+    ok_gh, msg_gh = gh_available()
+    print(f"  gh:                 {'✓' if ok_gh else '✗'} {msg_gh or 'authenticated'}")
+    ok_fzf = fzf_available()
+    print(f"  fzf:                {'✓' if ok_fzf else '✗'} {'installed' if ok_fzf else 'not found (install: brew install fzf) — TUI disabled'}")
+    state = load_state()
+    state.pop("apple_llm_status", None)
+    state.pop("apple_llm_reason", None)
+    save_state(state)
+    ok_llm, reason = ensure_apple_llm(state)
+    if ok_llm:
+        print("  Apple Intelligence: ✓ available (summaries enabled)")
+    else:
+        print(f"  Apple Intelligence: ⚠ unavailable — {reason} (search works, summaries disabled)")
+    cache_size = sum(
+        (p.stat().st_size for p in GISTS.rglob("*") if p.is_file()),
+        0,
+    ) if GISTS.exists() else 0
+    gist_count = len([d for d in GISTS.iterdir() if d.is_dir()]) if GISTS.exists() else 0
+    summary_count = len(list(GISTS.glob("*/_summary.json"))) if GISTS.exists() else 0
+    print(f"  cache:              {gist_count} gists, {summary_count} summaries, {cache_size / 1024 / 1024:.1f} MB")
+    print(f"                      {CACHE}")
+    if not ok_gh:
+        sys.exit(1)
+
+
+def tui(results, initial_query=""):
+    if not results:
+        print("No matches.")
+        return
+    lines = []
+    for sc, meta, hits in results:
+        desc = (meta["description"] or "(no description)").replace("\t", " ")
+        marker = " " if meta.get("public") else "🔒"
+        lines.append(f"{meta['id']}\t{marker} {meta['updated_at'][:10]}  {desc[:80]}")
+    self_path = str(Path(__file__).resolve())
+    preview_cmd = f"{sys.executable} {self_path} --preview {{1}}"
+    open_cmd = f"{sys.executable} {self_path} --open {{1}}"
+    copy_cmd = f"{sys.executable} {self_path} --url {{1}} | pbcopy 2>/dev/null || {sys.executable} {self_path} --url {{1}} | xclip -selection clipboard 2>/dev/null"
+    edit_cmd = f"{sys.executable} {self_path} --edit {{1}}"
+    state = load_state()
+    header = "Enter: open in browser  Ctrl-Y: copy URL  Ctrl-E: edit local copy"
+    if state.get("apple_llm_status") == "unavailable":
+        header = "⚠ summaries disabled — Apple Intelligence unavailable  │  " + header
+    fzf_args = [
+        "fzf",
+        "--ansi",
+        "--with-nth=2..",
+        "--delimiter=\t",
+        "--preview", preview_cmd,
+        "--preview-window=right:60%:wrap",
+        "--height=90%",
+        "--reverse",
+        "--header", header,
+        "--bind", f"enter:become({open_cmd})",
+        "--bind", f"ctrl-y:execute-silent({copy_cmd})+abort",
+        "--bind", f"ctrl-e:execute({edit_cmd})",
+    ]
+    if initial_query:
+        fzf_args += ["--query", initial_query]
+    try:
+        proc = subprocess.Popen(fzf_args, stdin=subprocess.PIPE, text=True)
+        proc.communicate("\n".join(lines))
+    except KeyboardInterrupt:
+        pass
+
+
+def preview(gist_id):
+    d = GISTS / gist_id
+    meta_file = d / "_meta.json"
+    if not meta_file.exists():
+        print(f"(no cached data for {gist_id})")
+        return
+    meta = json.loads(meta_file.read_text())
+    desc = meta["description"] or "(no description)"
+    marker = "public" if meta.get("public") else "🔒 secret"
+    print(f"\033[1m{desc}\033[0m")
+    print(f"{meta['updated_at'][:10]}  ·  {marker}")
+    print(f"{meta['html_url']}")
+    print("─" * 60)
+
+    summary_file = d / "_summary.json"
+    summary = None
+    if summary_file.exists():
+        try:
+            summary = json.loads(summary_file.read_text())
+        except json.JSONDecodeError:
+            summary = None
+
+    have_summary = bool(summary and summary.get("summary"))
+    if have_summary:
+        print(f"\033[32m✦ {summary['summary']}\033[0m")
+        print()
+
+    # When we have a summary: just list files with their one-liner purpose, no body dump.
+    # When we don't: show a short teaser (~20 lines) so the user has something concrete
+    # while the background worker catches up.
+    teaser_lines = 0 if have_summary else 20
+    for fn in meta["files"]:
+        file_summary = (summary or {}).get("files", {}).get(fn) if summary else None
+        if file_summary:
+            print(f"\033[36m▸ {fn}\033[0m  \033[2m— {file_summary}\033[0m")
+        else:
+            print(f"\033[36m▸ {fn}\033[0m")
+        if teaser_lines > 0:
+            p = d / safe_name(fn)
+            if p.exists():
+                try:
+                    text = p.read_text(errors="replace")
+                except OSError:
+                    text = ""
+                lines = text.splitlines()
+                snippet = "\n".join(lines[:teaser_lines])
+                if snippet.strip():
+                    print(snippet)
+                    if len(lines) > teaser_lines:
+                        print(f"\033[2m… ({len(lines) - teaser_lines} more lines)\033[0m")
+        print()
+
+    # Footer: subtle warning if Apple Intelligence summaries aren't available
+    state = load_state()
+    status = state.get("apple_llm_status")
+    if status == "unavailable":
+        reason = state.get("apple_llm_reason") or "unknown reason"
+        print(f"\033[2m⚠ no on-device summaries — Apple Intelligence unavailable ({reason})\033[0m")
+    elif not summary:
+        print("\033[2m⋯ summary pending (generating in background)\033[0m")
+
+
+def open_in_browser(gist_id):
+    d = GISTS / gist_id
+    meta_file = d / "_meta.json"
+    if not meta_file.exists():
+        print(f"gistgrep: unknown id {gist_id}", file=sys.stderr)
+        sys.exit(1)
+    meta = json.loads(meta_file.read_text())
+    url = meta["html_url"]
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+    subprocess.run([opener, url])
+
+
+def print_url(gist_id):
+    d = GISTS / gist_id
+    meta_file = d / "_meta.json"
+    if meta_file.exists():
+        print(json.loads(meta_file.read_text())["html_url"], end="")
+
+
+def edit_local(gist_id):
+    d = GISTS / gist_id
+    meta_file = d / "_meta.json"
+    if not meta_file.exists():
+        return
+    meta = json.loads(meta_file.read_text())
+    editor = os.environ.get("EDITOR", "vi")
+    files = [str(d / safe_name(fn)) for fn in meta["files"] if (d / safe_name(fn)).exists()]
+    if files:
+        subprocess.run([editor] + files)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Fast local search over your GitHub gists."
+    )
+    ap.add_argument("query", nargs="*", help="search term(s)")
+    ap.add_argument("--sync", action="store_true", help="force full resync")
+    ap.add_argument("--no-sync", action="store_true", help="skip sync, search cache only")
+    ap.add_argument("--limit", type=int, default=200)
+    ap.add_argument("--plain", action="store_true", help="plain-text output, no TUI")
+    ap.add_argument("--reconcile", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--preview", metavar="ID", help=argparse.SUPPRESS)
+    ap.add_argument("--open", metavar="ID", dest="open_id", help=argparse.SUPPRESS)
+    ap.add_argument("--url", metavar="ID", help=argparse.SUPPRESS)
+    ap.add_argument("--edit", metavar="ID", help=argparse.SUPPRESS)
+    ap.add_argument("--summarize-queue", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--summarize", metavar="ID", help="summarize one gist now (foreground)")
+    ap.add_argument("--check-llm", action="store_true", help="probe Apple Intelligence availability")
+    ap.add_argument("--refetch-content", action="store_true", help="re-fetch file contents for all cached gists (fixes empty files)")
+    ap.add_argument("--doctor", action="store_true", help="check dependencies and cache status")
+    ap.add_argument("--version", action="version", version="gistgrep 0.1.0")
+    args = ap.parse_args()
+
+    CACHE.mkdir(parents=True, exist_ok=True)
+    GISTS.mkdir(parents=True, exist_ok=True)
+
+    # Hard-stop: gh is non-negotiable for any operation that touches gists.
+    # Internal subcommands that only read the local cache don't need it.
+    needs_gh = not (
+        args.doctor
+        or args.preview
+        or args.open_id
+        or args.url
+        or args.edit
+        or args.reconcile
+        or args.summarize_queue
+        or args.summarize
+        or args.check_llm
+    )
+    if needs_gh:
+        ok_gh, msg_gh = gh_available()
+        if not ok_gh:
+            print(f"gistgrep: {msg_gh}", file=sys.stderr)
+            print("Run `gistgrep --doctor` for a full check.", file=sys.stderr)
+            sys.exit(1)
+
+    if args.doctor:
+        doctor()
+        return
+    if args.reconcile:
+        do_reconcile()
+        return
+    if args.preview:
+        preview(args.preview)
+        return
+    if args.open_id:
+        open_in_browser(args.open_id)
+        return
+    if args.url:
+        print_url(args.url)
+        return
+    if args.edit:
+        edit_local(args.edit)
+        return
+    if args.summarize_queue:
+        summarize_queue()
+        return
+    if args.summarize:
+        state = load_state()
+        ok, reason = ensure_apple_llm(state)
+        if not ok:
+            print(f"Apple Intelligence unavailable: {reason}", file=sys.stderr)
+            sys.exit(1)
+        summarize_gist(args.summarize)
+        return
+    if args.refetch_content:
+        # Walk every cached gist, re-fetch its canonical record so file contents populate.
+        if not GISTS.exists():
+            return
+        ids = [d.name for d in GISTS.iterdir() if (d / "_meta.json").exists()]
+        print(f"gistgrep: re-fetching content for {len(ids)} gists…", file=sys.stderr)
+        from concurrent.futures import ThreadPoolExecutor
+        def fetch_one(gid):
+            try:
+                g = gh_api(f"/gists/{gid}")
+                # also wipe stale summary since content is about to change
+                s = GISTS / gid / "_summary.json"
+                if s.exists():
+                    s.unlink()
+                save_gist(g)
+                return True
+            except Exception as e:
+                print(f"  warn: {gid}: {e}", file=sys.stderr)
+                return False
+        ok = 0
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for i, res in enumerate(ex.map(fetch_one, ids), 1):
+                if res:
+                    ok += 1
+                if i % 50 == 0:
+                    print(f"  {i}/{len(ids)}…", file=sys.stderr)
+        print(f"gistgrep: refetched {ok}/{len(ids)} gists.", file=sys.stderr)
+        return
+    if args.check_llm:
+        state = load_state()
+        # Force re-check
+        state.pop("apple_llm_status", None)
+        state.pop("apple_llm_reason", None)
+        save_state(state)
+        ok, reason = ensure_apple_llm(state)
+        if ok:
+            print("Apple Intelligence: available")
+        else:
+            print(f"Apple Intelligence: unavailable — {reason}")
+        return
+
+    state = load_state()
+    query = " ".join(args.query).strip()
+
+    if args.sync:
+        print("gistgrep: full sync…", file=sys.stderr)
+        n = sync(None)
+        state["last_updated_at"] = remote_max_updated_at()
+        save_state(state)
+        print(f"gistgrep: synced {n} gists.", file=sys.stderr)
+    elif not args.no_sync:
+        if state.get("last_updated_at") is None:
+            print(
+                "gistgrep: first run — initial sync (one-time, ~30s)…",
+                file=sys.stderr,
+            )
+            n = sync(None)
+            state["last_updated_at"] = remote_max_updated_at()
+            save_state(state)
+            print(f"gistgrep: synced {n} gists.", file=sys.stderr)
+        else:
+            changed, remote_max = needs_sync(state)
+            if changed and remote_max:
+                print(
+                    f"gistgrep: syncing changes since {state['last_updated_at'][:10]}…",
+                    file=sys.stderr,
+                )
+                n = sync(state["last_updated_at"])
+                state["last_updated_at"] = remote_max
+                save_state(state)
+                print(f"gistgrep: updated {n} gists.", file=sys.stderr)
+
+    if time.time() - state.get("last_reconcile", 0) > RECONCILE_INTERVAL:
+        reconcile_bg()
+
+    # Kick off background summarization if Apple Intelligence is (or might be) available
+    if state.get("apple_llm_status") != "unavailable":
+        summarize_bg()
+
+    # With no query, show everything (most recent first); otherwise ranked results.
+    if query:
+        results = search(query, args.limit)
+    else:
+        results = []
+        if GISTS.exists():
+            for d in GISTS.iterdir():
+                meta_file = d / "_meta.json"
+                if not meta_file.exists():
+                    continue
+                try:
+                    meta = json.loads(meta_file.read_text())
+                except json.JSONDecodeError:
+                    continue
+                results.append((0.0, meta, []))
+        results.sort(key=lambda x: x[1]["updated_at"], reverse=True)
+        results = results[: args.limit]
+
+    interactive = (
+        not args.plain
+        and sys.stdout.isatty()
+        and fzf_available()
+    )
+    if interactive:
+        tui(results, initial_query=query)
+    else:
+        if not args.plain and not fzf_available() and sys.stdout.isatty():
+            print("gistgrep: fzf not found — falling back to plain output. Install with: brew install fzf", file=sys.stderr)
+        fmt_plain(results)
+
+
+if __name__ == "__main__":
+    main()
