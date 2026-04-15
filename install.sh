@@ -32,7 +32,7 @@ fi
 
 install -m 0755 "$TMP" "$INSTALL_DIR/gistgrep"
 
-echo "✓ installed $(${INSTALL_DIR}/gistgrep --version)"
+echo "✓ installed $("${INSTALL_DIR}"/gistgrep --version)"
 
 case ":$PATH:" in
   *":${INSTALL_DIR}:"*) ;;
