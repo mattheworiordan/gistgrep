@@ -59,7 +59,9 @@ RECONCILE_WINDOW = 100
 LLM_RECHECK_INTERVAL = 86400            # re-probe an "unavailable" model daily
 SUMMARY_RETRY_INTERVAL = 7 * 86400      # retry a failed summary weekly, not every run
 SUMMARY_MAX_FILE_CHARS = 2000
-SUMMARY_MAX_TOTAL_CHARS = 8000
+SUMMARY_MAX_TOTAL_CHARS = 8000     # first try; shrunk when the model says it's too long
+SUMMARY_MIN_CHARS = 500
+SUMMARY_SHRINK_ATTEMPTS = 5
 SUMMARY_TIMEOUT = 60
 
 
@@ -113,6 +115,17 @@ struct AppleLLM {
 
 class LLMUnavailable(Exception):
     """The on-device model is switched off or missing (helper exit code 3)."""
+
+
+class PromptTooLong(Exception):
+    """The prompt didn't fit the model's context window (4,096 tokens on-device)."""
+
+    def __init__(self, tokens=None, limit=None):
+        super().__init__(f"{tokens} tokens > {limit}")
+        self.tokens, self.limit = tokens, limit
+
+
+_CONTEXT_RE = re.compile(r"contains (\d+) tokens.*?context size of (\d+)", re.S)
 
 
 def mark_llm_unavailable(state, reason, compile_failed=False):
@@ -205,6 +218,9 @@ def run_apple_llm(prompt, timeout=SUMMARY_TIMEOUT):
         )
         if r.returncode == 3:
             raise LLMUnavailable((r.stderr or "").strip()[:200] or "unavailable")
+        if r.returncode != 0 and "exceededContextWindowSize" in (r.stderr or ""):
+            m = _CONTEXT_RE.search(r.stderr)
+            raise PromptTooLong(*(int(x) for x in m.groups())) if m else PromptTooLong()
         if r.returncode != 0:
             return None
         return r.stdout.strip()
@@ -444,7 +460,7 @@ def start_upkeep(state):
         summarize_bg()
 
 
-def build_summary_prompt(meta, files_content):
+def build_summary_prompt(meta, files_content, max_total=SUMMARY_MAX_TOTAL_CHARS):
     # Keep prompt tight so LLM output stays well under its token cap
     max_files = 5
     items = list(files_content.items())[:max_files]
@@ -465,16 +481,16 @@ def build_summary_prompt(meta, files_content):
         "",
     ]
     total = 0
-    per_file_budget = max(400, SUMMARY_MAX_TOTAL_CHARS // max(1, len(items)))
+    per_file_budget = max(400, max_total // max(1, len(items)))
     for fn, content in items:
         snippet = content[:per_file_budget]
-        if total + len(snippet) > SUMMARY_MAX_TOTAL_CHARS:
-            snippet = snippet[: max(0, SUMMARY_MAX_TOTAL_CHARS - total)]
+        if total + len(snippet) > max_total:
+            snippet = snippet[: max(0, max_total - total)]
         total += len(snippet)
         parts.append(f"--- {fn} ---")
         parts.append(snippet if snippet else "(empty)")
         parts.append("")
-        if total >= SUMMARY_MAX_TOTAL_CHARS:
+        if total >= max_total:
             break
     return "\n".join(parts)
 
@@ -543,8 +559,22 @@ def summarize_gist(gist_id):
                 files_content[fn] = ""
         else:
             files_content[fn] = ""
-    prompt = build_summary_prompt(meta, files_content)
-    raw = run_apple_llm(prompt)
+    # Logs, JSON and IDs pack ~2 characters per token, so a character budget can
+    # overshoot the model's window. When it says so, shrink in proportion (leaving
+    # room for the reply) and try again.
+    raw = None
+    budget = SUMMARY_MAX_TOTAL_CHARS
+    for _ in range(SUMMARY_SHRINK_ATTEMPTS):
+        try:
+            raw = run_apple_llm(build_summary_prompt(meta, files_content, budget))
+            break
+        except PromptTooLong as e:
+            if e.tokens and e.limit:
+                budget = int(budget * (0.75 * e.limit) / e.tokens)
+            else:
+                budget //= 2
+            if budget < SUMMARY_MIN_CHARS:
+                break
     parsed = parse_summary_json(raw)
     if not isinstance(parsed, dict):
         parsed = None                   # valid JSON but not an object: treat as unparsed

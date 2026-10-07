@@ -357,6 +357,36 @@ class SummaryWorkerTests(CacheCase):
         p = json.loads(self.run_cli("--preview", "a", "--json").stdout)
         self.assertEqual(p["summary_status"], "failed")
 
+    # A stand-in with a tiny "context window": prompts over 3,000 characters fail
+    # the way FoundationModels does.
+    SMALL_WINDOW_MODEL = (
+        'input=""\n'
+        'while IFS= read -r line; do input="$input$line"; done\n'
+        'input="$input$line"\n'
+        'if [ ${#input} -gt 3000 ]; then\n'
+        '  echo "error: exceededContextWindowSize(Context(debugDescription: \\"Content contains '
+        '5000 tokens, which exceeds the maximum allowed context size of 4096.\\"))" >&2\n'
+        '  exit 1\n'
+        'fi\n'
+        "echo '{\"summary\":\"Shrunk to fit\",\"files\":{}}'\n")
+
+    def test_a_prompt_too_long_for_the_model_is_shrunk_until_it_fits(self):
+        self.add_gist("big", "Big log", {"log.txt": "x" * 20000})
+        self.fake_model(self.SMALL_WINDOW_MODEL)
+        r = self.run_cli("--summarize-queue")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        summary = json.loads((self.cache / "gists" / "big" / "_summary.json").read_text())
+        self.assertEqual(summary["summary"], "Shrunk to fit")
+
+    def test_a_prompt_that_never_fits_is_recorded_as_failed(self):
+        self.add_gist("big", "Big log", {"log.txt": "x" * 20000})
+        self.fake_model('while IFS= read -r line; do :; done\n'
+                        'echo "error: exceededContextWindowSize(no counts)" >&2\nexit 1\n')
+        r = self.run_cli("--summarize-queue")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        p = json.loads(self.run_cli("--preview", "big", "--json").stdout)
+        self.assertEqual(p["summary_status"], "failed")
+
     def test_odd_generated_at_values_do_not_stop_the_worker(self):
         for gid, generated_at in [("naive", "2026-01-01T00:00:00"), ("null", None), ("junk", "soon")]:
             self.add_gist(gid, gid, {"a": "x"},
