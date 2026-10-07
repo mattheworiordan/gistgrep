@@ -15,5 +15,7 @@ jobs:
           python-version: "3.12"
       - name: Syntax check
         run: python3 -m py_compile bin/gistgrep
+      - name: Tests
+        run: python3 -m unittest discover -s tests -v
       - name: Shellcheck install.sh
         run: sudo apt-get install -y shellcheck && shellcheck install.sh

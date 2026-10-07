@@ -41,8 +41,11 @@ Both install to `~/.local/bin/gistgrep`. Make sure that's on your `PATH`.
 gistgrep                    # interactive TUI over all your gists
 gistgrep ait                # open TUI pre-filtered to "ait"
 gistgrep --plain ait        # plain-text output (scriptable)
+gistgrep --json ait chat    # JSON output, for launchers and other tools
 gistgrep --doctor           # verify dependencies
 ```
+
+Every word you type must match somewhere in the gist (title, filename or body).
 
 ### TUI key bindings
 
@@ -53,11 +56,12 @@ gistgrep --doctor           # verify dependencies
 
 ### Ranking
 
-Results are scored by:
-- **Title / description**: ×10 per match
+Each word of the query is scored by:
+- **Title / description**: ×10 per match (a title containing the whole phrase counts once more)
 - **Filename**: ×5 per match
-- **File body**: ×1 per match
+- **File body**: ×1 per match, at most 9 per word — less than one title match, so a long file that repeats a word ranks below a gist that has the word in its title (unless it is much newer)
 - **Recency boost**: up to +5 for very recent gists, decaying over 180 days
+- **Ties**: most recently updated first
 
 Type into the fzf prompt to narrow further with fuzzy matching.
 
@@ -70,10 +74,29 @@ Type into the fzf prompt to narrow further with fuzzy matching.
 | **Incremental sync** | `/gists?since=<timestamp>` fetches only updated gists |
 | **Deletion reconcile** | Weekly, in the background — fetches last 100 gists, prunes any locally-cached ones that disappeared |
 | **AI summaries** | Apple Intelligence (`FoundationModels` framework) via a small embedded Swift helper, compiled on first use |
-| **Summaries are async** | Written in the background after sync; never block search |
+| **Summaries are async** | Written in the background after sync; never block search. A failed summary is retried weekly. Whether Apple Intelligence is on is re-checked daily (if the helper failed to compile, it waits for a macOS update or `gistgrep --check-llm`) |
 | **Interactive UI** | `fzf` with a custom preview pane |
 
-All state lives in `~/.cache/gistgrep/`. Delete it to start fresh.
+All state lives in `~/.cache/gistgrep/` (or `$GISTGREP_CACHE`). Delete it to start fresh.
+
+## Use it from other tools
+
+`gistgrep` is built to sit behind a launcher (Raycast, Alfred, a menu-bar app). The pattern: sync once when your UI opens, then search the cache on every keystroke.
+
+```bash
+gistgrep --sync-only --json           # once per open: freshness check + delta sync
+gistgrep --no-sync --json -- <words>  # per keystroke: cache only, no network, no gh, ~0.3s
+gistgrep --no-sync --json             # no query: most recently updated gists first
+gistgrep --preview <id> --json        # one gist: summary, and each file's summary, path and first 20 lines
+```
+
+Put `--` before the words a user typed, so a word like `--sync` is searched for, not run.
+
+`--sync-only --json` prints `{"ok": true, "message": …, "last_updated_at": …}` (`message` is `null` when nothing changed). On failure it exits non-zero with the reason on stderr and prints nothing on stdout.
+
+Search results are a JSON array. Each item has `id`, `description`, `updated_at`, `html_url`, `public`, `files`, `score`, `hits`, `summary` (or `null`) and `snippet` (the body line that best matches the query).
+
+The preview's `summary_status` is `ready`, `pending`, `failed` or `unavailable` (Apple Intelligence off; `summary_unavailable_reason` says why).
 
 ## Requirements
 
