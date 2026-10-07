@@ -74,7 +74,7 @@ Type into the fzf prompt to narrow further with fuzzy matching.
 | **Incremental sync** | `/gists?since=<timestamp>` fetches only updated gists |
 | **Deletion reconcile** | Weekly, in the background — fetches last 100 gists, prunes any locally-cached ones that disappeared |
 | **AI summaries** | Apple Intelligence (`FoundationModels` framework) via a small embedded Swift helper, compiled on first use |
-| **Summaries are async** | Written in the background after sync; never block search. A failed summary is retried weekly. Whether Apple Intelligence is on is re-checked daily (if the helper failed to compile, it waits for a macOS update or `gistgrep --check-llm`) |
+| **Summaries are async** | Written in the background after sync; never block search. A failed summary is retried weekly. Whether Apple Intelligence is on is re-checked daily (if the helper failed to compile, it waits for a macOS update or `gistgrep --check-llm`); when it comes on, every summary that failed before then is retried at once. Turned it on just now? Run `gistgrep --check-llm` |
 | **Interactive UI** | `fzf` with a custom preview pane |
 
 All state lives in `~/.cache/gistgrep/` (or `$GISTGREP_CACHE`). Delete it to start fresh.

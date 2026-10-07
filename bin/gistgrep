@@ -181,8 +181,14 @@ def ensure_apple_llm(state):
             return mark_llm_unavailable(state, msg[:200])
     except subprocess.TimeoutExpired:
         return mark_llm_unavailable(state, "smoke test timed out")
-    update_state(state, apple_llm_status="available", apple_llm_reason=None,
-                 apple_llm_checked_at=int(time.time()))
+    now = int(time.time())
+    fields = {"apple_llm_status": "available", "apple_llm_reason": None,
+              "apple_llm_checked_at": now}
+    if state.get("apple_llm_status") != "available":
+        # The model just came (back) on: summaries that failed before now may
+        # have failed only because it was off, so they get one retry at once.
+        fields["apple_llm_available_since"] = now
+    update_state(state, **fields)
     return True, None
 
 
@@ -553,15 +559,18 @@ def summarize_gist(gist_id):
     return True
 
 
-def summary_retry_due(summ):
+def summary_retry_due(summ, available_since=None):
     """A failed summary is retried weekly — an unconditional retry re-ran the
-    model over every failed gist on every invocation."""
+    model over every failed gist on every invocation — and once straight away
+    if it failed before the model last came on (it may have been off)."""
     try:
         generated = datetime.fromisoformat(summ.get("generated_at") or "")
     except (TypeError, ValueError):
         return True
     if generated.tzinfo is None:
         generated = generated.replace(tzinfo=timezone.utc)
+    if available_since and generated.timestamp() < available_since:
+        return True
     return (datetime.now(timezone.utc) - generated).total_seconds() > SUMMARY_RETRY_INTERVAL
 
 
@@ -596,9 +605,11 @@ def summarize_queue():
     try:
         os.write(fd, f"{os.getpid()}\n".encode())
         os.close(fd)
-        available, _ = ensure_apple_llm(load_state())
+        state = load_state()
+        available, _ = ensure_apple_llm(state)
         if not available or not GISTS.exists():
             return
+        available_since = state.get("apple_llm_available_since")
         for d in sorted(GISTS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             meta_file = d / "_meta.json"
             summary_file = d / "_summary.json"
@@ -610,7 +621,8 @@ def summarize_queue():
                     meta = json.loads(meta_file.read_text())
                     summ = json.loads(summary_file.read_text())
                     if summ.get("updated_at") == meta["updated_at"]:
-                        needs = bool(summ.get("_unparsed")) and summary_retry_due(summ)
+                        needs = (bool(summ.get("_unparsed"))
+                                 and summary_retry_due(summ, available_since))
                 except (json.JSONDecodeError, OSError):
                     pass
             if needs:
@@ -1163,7 +1175,8 @@ def main():
         forget_llm_status(state)        # force a re-check
         ok, reason = ensure_apple_llm(state)
         if ok:
-            print("Apple Intelligence: available")
+            summarize_bg()
+            print("Apple Intelligence: available — writing any missing summaries in the background")
         else:
             print(f"Apple Intelligence: unavailable — {reason}")
         return

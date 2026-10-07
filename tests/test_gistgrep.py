@@ -369,6 +369,34 @@ class SummaryWorkerTests(CacheCase):
             summary = json.loads((self.cache / "gists" / gid / "_summary.json").read_text())
             self.assertEqual(summary["summary"], "Retried", gid)
 
+    def test_failures_from_before_the_model_came_back_are_retried_at_once(self):
+        self.add_gist("a", "A", {"a": "x"},
+                      summary={"summary": "", "files": {}, "_unparsed": True,
+                               "generated_at": (datetime.now(timezone.utc)
+                                                - timedelta(hours=1)).isoformat()})
+        self.write_state(apple_llm_status="unavailable", apple_llm_reason="off",
+                         apple_llm_checked_at=int(time.time()) - 2 * 86400)
+        self.fake_model("while read -r _; do :; done\necho '{\"summary\":\"Back on\",\"files\":{}}'\n")
+        r = self.run_cli("--summarize-queue")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        summary = json.loads((self.cache / "gists" / "a" / "_summary.json").read_text())
+        if sys.platform != "darwin":
+            self.assertEqual(summary["summary"], "")      # the model can't run off macOS
+            return
+        self.assertEqual(summary["summary"], "Back on")
+
+    def test_a_recent_failure_with_the_model_on_all_along_waits_a_week(self):
+        self.add_gist("a", "A", {"a": "x"},
+                      summary={"summary": "", "files": {}, "_unparsed": True,
+                               "generated_at": (datetime.now(timezone.utc)
+                                                - timedelta(hours=1)).isoformat()})
+        self.write_state(apple_llm_status="available", apple_llm_checked_at=int(time.time()),
+                         apple_llm_available_since=int(time.time()) - 30 * 86400)
+        self.fake_model("while read -r _; do :; done\necho '{\"summary\":\"Too soon\",\"files\":{}}'\n")
+        self.run_cli("--summarize-queue")
+        summary = json.loads((self.cache / "gists" / "a" / "_summary.json").read_text())
+        self.assertEqual(summary["summary"], "")
+
     def test_unavailable_model_is_rechecked_after_a_day(self):
         self.add_gist("a", "A", {"a": "x"})
         self.write_state(apple_llm_status="unavailable", apple_llm_reason="off",
